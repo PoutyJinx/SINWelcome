@@ -1,3 +1,4 @@
+import asyncio
 import random
 from datetime import datetime, timezone
 from typing import Optional
@@ -27,10 +28,10 @@ FOOTERS = (
 
 
 class SINWelcome(commands.Cog):
-    """SIN Corporation welcomes and private account-age screening."""
+    """SIN Corporation member lifecycle and account-age screening."""
 
     __author__ = "PoutyJinx"
-    __version__ = "1.0.0"
+    __version__ = "2.0.0"
 
     def __init__(self, bot):
         self.bot = bot
@@ -47,7 +48,12 @@ class SINWelcome(commands.Cog):
             critical_days=7,
             high_days=30,
             caution_days=90,
+            public_departures=True,
+            public_kicks=True,
+            public_bans=True,
+            twitch_channel="poutyjinx",
         )
+        self._pending_bans = {}
 
     @staticmethod
     def _safe_name(member: discord.Member) -> str:
@@ -149,6 +155,133 @@ class SINWelcome(commands.Cog):
                 except discord.HTTPException:
                     pass
 
+    @staticmethod
+    def _roles_text(member: discord.Member) -> str:
+        roles = [discord.utils.escape_markdown(role.name) for role in member.roles if not role.is_default()]
+        text = humanize_list(roles) if roles else "No roles"
+        return text[:1024]
+
+    def _departure_embed(self, member: discord.Member, action: str, reason: Optional[str] = None) -> discord.Embed:
+        titles = {
+            "left": "📤 DWELLER DEPARTED",
+            "kick": "⚠️ ACCESS REVOKED",
+            "ban": "⛔ EMPLOYMENT TERMINATED",
+        }
+        colors = {"left": discord.Color.dark_purple(), "kick": discord.Color.orange(), "ban": discord.Color.red()}
+        descriptions = {
+            "left": "A Dweller has left S.I.N. Corporation. Their desk has already been reassigned.",
+            "kick": "Security has escorted a former Dweller from corporate territory.",
+            "ban": "Their access credentials have been permanently revoked by S.I.N. Security.",
+        }
+        embed = discord.Embed(title=titles[action], description=descriptions[action], color=colors[action], timestamp=datetime.now(timezone.utc))
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.add_field(name="Former Dweller", value=self._safe_name(member), inline=True)
+        if reason and action in {"kick", "ban"}:
+            embed.add_field(name="Public Reason", value=discord.utils.escape_mentions(reason)[:1024], inline=False)
+        embed.set_footer(text="S.I.N. Corporation • Personnel records updated")
+        return embed
+
+    def _termination_log_embed(
+        self,
+        member: discord.Member,
+        action: str,
+        moderator: Optional[discord.abc.User],
+        public_reason: Optional[str],
+        moderator_note: Optional[str],
+        dm_status: Optional[str] = None,
+    ) -> discord.Embed:
+        joined = member.joined_at
+        days = self._account_days(member)
+        embed = discord.Embed(
+            title="🛡️ PERSONNEL DEPARTURE REPORT",
+            color=discord.Color.red() if action == "ban" else discord.Color.orange() if action == "kick" else discord.Color.dark_purple(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.add_field(name="Former Dweller", value=self._safe_name(member), inline=True)
+        embed.add_field(name="Action", value={"left": "Voluntary/unknown departure", "kick": "Kick", "ban": "Permanent ban"}[action], inline=True)
+        embed.add_field(name="User ID", value=f"`{member.id}`", inline=False)
+        if moderator:
+            embed.add_field(name="Responsible Moderator", value=f"{moderator} (`{moderator.id}`)", inline=False)
+        if public_reason:
+            embed.add_field(name="Public Reason", value=public_reason[:1024], inline=False)
+        if moderator_note:
+            embed.add_field(name="Private Moderator Note", value=moderator_note[:1024], inline=False)
+        if dm_status is not None:
+            embed.add_field(name="Ban DM", value=dm_status, inline=False)
+        embed.add_field(name="Account Age", value=self._age_text(days), inline=True)
+        if joined:
+            stayed = max(0, (datetime.now(timezone.utc) - joined).days)
+            embed.add_field(name="Joined Corporation", value=discord.utils.format_dt(joined, "F"), inline=True)
+            embed.add_field(name="Time in Server", value=self._age_text(stayed), inline=True)
+        embed.add_field(name="Roles Before Departure", value=self._roles_text(member), inline=False)
+        embed.set_footer(text="S.I.N. Security Division • Internal record")
+        return embed
+
+    @staticmethod
+    def _ban_dm_embed(guild_name: str, public_reason: str, twitch: str) -> discord.Embed:
+        embed = discord.Embed(
+            title="⛔ S.I.N. CORPORATION ACCESS REVOKED",
+            description=(
+                f"You have been banned from **{discord.utils.escape_markdown(guild_name)}**.\n\n"
+                f"**Reason:** {discord.utils.escape_mentions(public_reason)}\n\n"
+                "Unban requests are handled through the **Twitch unban appeal system** "
+                f"for **{discord.utils.escape_markdown(twitch)}**:\n"
+                f"https://twitch.tv/{twitch}\n\n"
+                "Please do not contact moderators privately to bypass the appeal process."
+            ),
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text="S.I.N. Corporation • Security Division")
+        return embed
+
+    async def _audit_action(self, guild: discord.Guild, member_id: int):
+        if not guild.me.guild_permissions.view_audit_log:
+            return None, None, None
+        now = datetime.now(timezone.utc)
+        for action, label in ((discord.AuditLogAction.ban, "ban"), (discord.AuditLogAction.kick, "kick")):
+            try:
+                async for entry in guild.audit_logs(limit=8, action=action):
+                    if getattr(entry.target, "id", None) == member_id and abs((now - entry.created_at).total_seconds()) <= 20:
+                        return label, entry.user, entry.reason
+            except (discord.Forbidden, discord.HTTPException):
+                return None, None, None
+        return None, None, None
+
+    async def _send_departure(self, member: discord.Member):
+        data = await self.config.guild(member.guild).all()
+        if not data["enabled"]:
+            return
+        await asyncio.sleep(2)
+        pending = self._pending_bans.pop((member.guild.id, member.id), None)
+        action, moderator, audit_reason = await self._audit_action(member.guild, member.id)
+        if pending:
+            action = "ban"
+            moderator = pending["moderator"]
+            public_reason = pending["public_reason"]
+            moderator_note = pending["moderator_note"]
+            dm_status = pending["dm_status"]
+        else:
+            action = action or "left"
+            public_reason = audit_reason if action in {"ban", "kick"} else None
+            moderator_note = audit_reason if action in {"ban", "kick"} else None
+            dm_status = "Not sent: ban was performed outside SINWelcome." if action == "ban" else None
+
+        public_enabled = data[{"left": "public_departures", "kick": "public_kicks", "ban": "public_bans"}[action]]
+        public_channel = member.guild.get_channel(data["public_channel"]) if data["public_channel"] else None
+        if public_enabled and public_channel:
+            try:
+                await public_channel.send(embed=self._departure_embed(member, action, public_reason))
+            except discord.HTTPException:
+                pass
+        mod_channel = member.guild.get_channel(data["mod_channel"]) if data["mod_channel"] else None
+        if data["mod_log"] and mod_channel:
+            try:
+                await mod_channel.send(embed=self._termination_log_embed(member, action, moderator, public_reason, moderator_note, dm_status))
+            except discord.HTTPException:
+                pass
+
         if data["mod_log"] and data["mod_channel"]:
             channel = member.guild.get_channel(data["mod_channel"])
             if channel:
@@ -166,6 +299,10 @@ class SINWelcome(commands.Cog):
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         await self._send_welcome(member)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        await self._send_departure(member)
 
     @commands.hybrid_group(name="sinwelcome", invoke_without_command=True)
     @commands.guild_only()
@@ -245,6 +382,112 @@ class SINWelcome(commands.Cog):
         await self.config.guild(ctx.guild).mod_log.set(enabled)
         await ctx.send(f"✅ Moderator reports are now **{'enabled' if enabled else 'disabled'}**.")
 
+    @sinwelcome.command(name="departuretoggle")
+    async def departure_toggle(self, ctx: commands.Context, leaves: bool, kicks: bool, bans: bool):
+        """Choose which departure types receive a public announcement."""
+        guild = self.config.guild(ctx.guild)
+        await guild.public_departures.set(leaves)
+        await guild.public_kicks.set(kicks)
+        await guild.public_bans.set(bans)
+        await ctx.send(f"✅ Public notices updated. Leaves: **{'On' if leaves else 'Off'}** • Kicks: **{'On' if kicks else 'Off'}** • Bans: **{'On' if bans else 'Off'}**")
+
+    @sinwelcome.command(name="twitch")
+    async def twitch_channel(self, ctx: commands.Context, channel_name: str):
+        """Set the Twitch channel named in ban appeal DMs."""
+        clean = channel_name.strip().removeprefix("https://www.twitch.tv/").strip("/")
+        if not clean or any(char.isspace() for char in clean):
+            await ctx.send("❌ Enter a Twitch channel name, for example `PoutyJinx`.")
+            return
+        await self.config.guild(ctx.guild).twitch_channel.set(clean)
+        await ctx.send(f"✅ Ban DMs will direct users to Twitch unban appeals for **{discord.utils.escape_markdown(clean)}**.")
+
+    @sinwelcome.command(name="ban")
+    @checks.mod_or_permissions(ban_members=True)
+    @commands.bot_has_permissions(ban_members=True)
+    async def ban_member(self, ctx: commands.Context, member: discord.Member, public_reason: str, *, moderator_note: str = "No private note provided."):
+        """DM and ban a member with a public reason and private moderator note."""
+        if member == ctx.author or member == ctx.guild.me:
+            await ctx.send("❌ Corporate Security refuses to process that particular termination form.")
+            return
+        if ctx.author != ctx.guild.owner and member.top_role >= ctx.author.top_role:
+            await ctx.send("❌ You cannot ban a member with an equal or higher role.")
+            return
+        if member.top_role >= ctx.guild.me.top_role:
+            await ctx.send("❌ My role must be above that member's highest role before I can ban them.")
+            return
+        data = await self.config.guild(ctx.guild).all()
+        twitch = data["twitch_channel"]
+        dm_status = "✅ Delivered before the ban."
+        dm = self._ban_dm_embed(ctx.guild.name, public_reason, twitch)
+        try:
+            await member.send(embed=dm)
+        except (discord.Forbidden, discord.HTTPException):
+            dm_status = "❌ Could not deliver (DMs closed, blocked, or unavailable)."
+        self._pending_bans[(ctx.guild.id, member.id)] = {
+            "moderator": ctx.author,
+            "public_reason": public_reason,
+            "moderator_note": moderator_note,
+            "dm_status": dm_status,
+        }
+        try:
+            await ctx.guild.ban(member, reason=f"{public_reason} | Internal note: {moderator_note}"[:512])
+        except discord.HTTPException:
+            self._pending_bans.pop((ctx.guild.id, member.id), None)
+            await ctx.send("❌ The DM attempt finished, but Discord rejected the ban. Check my permissions and role position.")
+            return
+        await ctx.send(f"✅ **{self._safe_name(member)}** was banned.\nBan DM: {dm_status}")
+
+    async def _send_departure_test(self, ctx: commands.Context, action: str, member: discord.Member):
+        data = await self.config.guild(ctx.guild).all()
+        public_channel = ctx.guild.get_channel(data["public_channel"]) if data["public_channel"] else None
+        mod_channel = ctx.guild.get_channel(data["mod_channel"]) if data["mod_channel"] else None
+        reason = "Test reason: unauthorized snacks in the infernal break room." if action != "left" else None
+        if public_channel:
+            await public_channel.send(embed=self._departure_embed(member, action, reason))
+        if mod_channel:
+            await mod_channel.send(embed=self._termination_log_embed(
+                member,
+                action,
+                ctx.author if action != "left" else None,
+                reason,
+                "Test moderator note: This is only a preview; no action was taken." if action != "left" else None,
+                "🧪 Test preview only; no DM was sent." if action == "ban" else None,
+            ))
+        if not public_channel and not mod_channel:
+            await ctx.send("❌ Configure the public and moderator channels first.")
+            return
+        await ctx.send(f"✅ **{action.title()}** preview dispatched. Nobody was removed, kicked, banned, or mildly inconvenienced.")
+
+    @sinwelcome.command(name="testleave")
+    async def test_leave(self, ctx: commands.Context, member: Optional[discord.Member] = None):
+        """Preview public and private leave reports without removing anyone."""
+        await self._send_departure_test(ctx, "left", member or ctx.author)
+
+    @sinwelcome.command(name="testkick")
+    async def test_kick(self, ctx: commands.Context, member: Optional[discord.Member] = None):
+        """Preview public and private kick reports without removing anyone."""
+        await self._send_departure_test(ctx, "kick", member or ctx.author)
+
+    @sinwelcome.command(name="testban")
+    async def test_ban(self, ctx: commands.Context, member: Optional[discord.Member] = None):
+        """Preview public and private ban reports without banning anyone."""
+        await self._send_departure_test(ctx, "ban", member or ctx.author)
+
+    @sinwelcome.command(name="testdm")
+    async def test_dm(self, ctx: commands.Context):
+        """Send the command user a private preview of the ban DM."""
+        data = await self.config.guild(ctx.guild).all()
+        try:
+            await ctx.author.send(embed=self._ban_dm_embed(
+                ctx.guild.name,
+                "Test reason: this is only a preview; you have not been banned.",
+                data["twitch_channel"],
+            ))
+        except (discord.Forbidden, discord.HTTPException):
+            await ctx.send("❌ I could not DM you. Enable direct messages for this server and try again.")
+            return
+        await ctx.send("✅ Ban-DM preview sent privately. You have not been banned.")
+
     @sinwelcome.command(name="test")
     async def test(self, ctx: commands.Context, member: Optional[discord.Member] = None):
         """Preview both configured messages using a chosen member or yourself."""
@@ -270,5 +513,7 @@ class SINWelcome(commands.Cog):
         embed.add_field(name="Active Features", value=humanize_list(enabled_features) if enabled_features else "None", inline=False)
         embed.add_field(name="Screening Levels", value=(f"🔴 Critical: under {data['critical_days']} days\n🟠 High: under {data['high_days']} days\n🟡 Caution: under {data['caution_days']} days\n🟣 Cleared: {data['caution_days']}+ days"), inline=False)
         embed.add_field(name="Role Pings", value=f"Critical: {'On' if data['ping_critical'] else 'Off'}\nHigh: {'On' if data['ping_high'] else 'Off'}", inline=True)
+        embed.add_field(name="Public Departures", value=f"Leaves: {'On' if data['public_departures'] else 'Off'}\nKicks: {'On' if data['public_kicks'] else 'Off'}\nBans: {'On' if data['public_bans'] else 'Off'}", inline=True)
+        embed.add_field(name="Twitch Appeals", value=f"https://twitch.tv/{data['twitch_channel']}", inline=False)
         embed.set_footer(text="All configuration commands require moderator permissions.")
         await ctx.send(embed=embed)
