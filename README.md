@@ -17,6 +17,7 @@ A polished member lifecycle, welcome, and account-age screening cog for Red-Disc
 - A dedicated ban command with separate public reason and private moderator note
 - A pre-ban DM directing the user to the PoutyJinx Twitch unban appeal system
 - Delivery status recorded in the private moderator report when a ban DM cannot be sent
+- Latest-arrival lookup with a saved fallback record
 
 ## Required Discord setting
 
@@ -89,9 +90,12 @@ Every command is moderator-only and available as `/sinwelcome ...` and `[p]sinwe
 | `testkick [member]` | Preview kick messages without removing anyone |
 | `testban [member]` | Preview ban messages without banning anyone |
 | `testdm` | Send yourself a private preview of the ban DM |
+| `latestjoin` (alias: `lastjoin`) | Show the newest member to join, with their account-age screening report |
 | `settings` | Show the current configuration |
 
 Default screening levels are Critical under 7 days, High under 30 days, Caution under 90 days, and Cleared at 90 days or older. Critical role pings are enabled by default; High pings are disabled by default.
+
+Use `/sinwelcome latestjoin` or `[p]sinwelcome latestjoin` whenever moderators need to retrieve the newest arrival. It works immediately by checking the current member list, while future joins are also saved as a fallback in case the newest member leaves before staff checks.
 
 ## Ban command examples
 

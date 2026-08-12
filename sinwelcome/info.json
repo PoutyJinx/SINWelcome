@@ -1,10 +1,10 @@
 {
   "author": ["PoutyJinx"],
-  "description": "A SIN Corporation member lifecycle system with welcomes, account-age screening, departure logs, and ban appeal DMs.",
+  "description": "A SIN Corporation member lifecycle system with welcomes, account-age screening, latest-arrival lookup, departure logs, and ban appeal DMs.",
   "install_msg": "Thank you for installing SINWelcome. Use `[p]sinwelcome setup` or `/sinwelcome setup` to configure it. Enable Server Members Intent and grant View Audit Log for reliable departure classification.",
   "short": "SIN Corporation welcomes, security screening, and departure logs.",
   "tags": ["welcome", "security", "moderation", "account age", "departures", "bans", "sin corporation"],
   "requirements": [],
   "min_bot_version": "3.5.0",
-  "end_user_data_statement": "This cog stores only server configuration. It does not permanently store member information."
+  "end_user_data_statement": "This cog stores server configuration and one latest-join snapshot containing the member's ID, names, avatar URL, account creation time, join time, and bot status. The snapshot is replaced whenever another member joins."
 }

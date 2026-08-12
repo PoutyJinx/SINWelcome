@@ -31,7 +31,7 @@ class SINWelcome(commands.Cog):
     """SIN Corporation member lifecycle and account-age screening."""
 
     __author__ = "PoutyJinx"
-    __version__ = "2.0.0"
+    __version__ = "2.1.0"
 
     def __init__(self, bot):
         self.bot = bot
@@ -52,6 +52,7 @@ class SINWelcome(commands.Cog):
             public_kicks=True,
             public_bans=True,
             twitch_channel="poutyjinx",
+            latest_join={},
         )
         self._pending_bans = {}
 
@@ -141,10 +142,21 @@ class SINWelcome(commands.Cog):
         embed.set_footer(text="S.I.N. Security Division • Manual judgment required")
         return embed
 
-    async def _send_welcome(self, member: discord.Member):
+    async def _send_welcome(self, member: discord.Member, *, record_join: bool = True):
         data = await self.config.guild(member.guild).all()
         if not data["enabled"]:
             return
+
+        if record_join:
+            await self.config.guild(member.guild).latest_join.set({
+                "user_id": member.id,
+                "name": member.name,
+                "display_name": member.display_name,
+                "avatar_url": str(member.display_avatar.url),
+                "created_at": member.created_at.isoformat(),
+                "joined_at": (member.joined_at or datetime.now(timezone.utc)).isoformat(),
+                "bot": member.bot,
+            })
 
         allowed = discord.AllowedMentions(users=True, roles=False, everyone=False)
         if data["public_welcome"] and data["public_channel"]:
@@ -152,6 +164,20 @@ class SINWelcome(commands.Cog):
             if channel:
                 try:
                     await channel.send(embed=self._public_embed(member), allowed_mentions=allowed)
+                except discord.HTTPException:
+                    pass
+
+        if data["mod_log"] and data["mod_channel"]:
+            channel = member.guild.get_channel(data["mod_channel"])
+            if channel:
+                days = self._account_days(member)
+                level = self._level(days, data)[0]
+                should_ping = (level == "CRITICAL REVIEW" and data["ping_critical"]) or (level == "HIGH ATTENTION" and data["ping_high"])
+                role = member.guild.get_role(data["alert_role"]) if data["alert_role"] else None
+                content = role.mention if role and should_ping else None
+                mod_mentions = discord.AllowedMentions(users=True, roles=bool(content), everyone=False)
+                try:
+                    await channel.send(content=content, embed=self._mod_embed(member, data), allowed_mentions=mod_mentions)
                 except discord.HTTPException:
                     pass
 
@@ -281,20 +307,6 @@ class SINWelcome(commands.Cog):
                 await mod_channel.send(embed=self._termination_log_embed(member, action, moderator, public_reason, moderator_note, dm_status))
             except discord.HTTPException:
                 pass
-
-        if data["mod_log"] and data["mod_channel"]:
-            channel = member.guild.get_channel(data["mod_channel"])
-            if channel:
-                days = self._account_days(member)
-                level = self._level(days, data)[0]
-                should_ping = (level == "CRITICAL REVIEW" and data["ping_critical"]) or (level == "HIGH ATTENTION" and data["ping_high"])
-                role = member.guild.get_role(data["alert_role"]) if data["alert_role"] else None
-                content = role.mention if role and should_ping else None
-                mod_mentions = discord.AllowedMentions(users=True, roles=bool(content), everyone=False)
-                try:
-                    await channel.send(content=content, embed=self._mod_embed(member, data), allowed_mentions=mod_mentions)
-                except discord.HTTPException:
-                    pass
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
@@ -492,8 +504,50 @@ class SINWelcome(commands.Cog):
     async def test(self, ctx: commands.Context, member: Optional[discord.Member] = None):
         """Preview both configured messages using a chosen member or yourself."""
         target = member or ctx.author
-        await self._send_welcome(target)
+        await self._send_welcome(target, record_join=False)
         await ctx.send(f"✅ Test dispatched using **{self._safe_name(target)}**. No settings or member data were changed.")
+
+    @sinwelcome.command(name="latestjoin", aliases=["lastjoin"])
+    async def latest_join(self, ctx: commands.Context):
+        """Show the most recent member to join the server."""
+        members = [member for member in ctx.guild.members if member.joined_at is not None]
+        if members:
+            newest = max(members, key=lambda member: member.joined_at)
+            data = await self.config.guild(ctx.guild).all()
+            embed = self._mod_embed(newest, data)
+            embed.title = "🔎 LATEST PERSONNEL ARRIVAL"
+            embed.description = (
+                f"The newest current member of **{discord.utils.escape_markdown(ctx.guild.name)}** is shown below.\n\n"
+                f"{embed.description}"
+            )
+            await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            return
+
+        saved = await self.config.guild(ctx.guild).latest_join()
+        if not saved:
+            await ctx.send("❌ No join record is available yet. SINWelcome will save the next arrival automatically.")
+            return
+
+        created = datetime.fromisoformat(saved["created_at"])
+        joined = datetime.fromisoformat(saved["joined_at"])
+        age_days = max(0, (datetime.now(timezone.utc) - created).days)
+        embed = discord.Embed(
+            title="🔎 LATEST SAVED PERSONNEL ARRIVAL",
+            description="The member is no longer available in the server member list, so this is the last saved join record.",
+            color=discord.Color.from_rgb(143, 67, 214),
+            timestamp=joined,
+        )
+        if saved.get("avatar_url"):
+            embed.set_thumbnail(url=saved["avatar_url"])
+        embed.add_field(name="Registered Name", value=discord.utils.escape_markdown(saved["display_name"]), inline=True)
+        embed.add_field(name="Username", value=discord.utils.escape_markdown(saved["name"]), inline=True)
+        embed.add_field(name="User ID", value=f"`{saved['user_id']}`", inline=False)
+        embed.add_field(name="Account Created", value=discord.utils.format_dt(created, "F"), inline=True)
+        embed.add_field(name="Account Age", value=self._age_text(age_days), inline=True)
+        embed.add_field(name="Joined Corporation", value=discord.utils.format_dt(joined, "F"), inline=True)
+        embed.add_field(name="Automated Account", value="Yes" if saved.get("bot") else "No", inline=True)
+        embed.set_footer(text="S.I.N. Security Division • Saved arrival record")
+        await ctx.send(embed=embed)
 
     @sinwelcome.command(name="settings")
     async def settings(self, ctx: commands.Context):
